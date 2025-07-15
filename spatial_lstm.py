@@ -6,7 +6,7 @@
 import jax
 import jax.numpy as jnp
 from flax import nnx
-import numpy as np
+from functools import partial
 
 # Einsum notation shorthand
 # H: input_dim + hidden_dim
@@ -17,27 +17,25 @@ import numpy as np
 # n: image width (pixel cols)
 # v: grayscale range [0, 256)
 
+
 class SpatialLSTMCell(nnx.Module):
     """Spatial LSTM Cell"""
-    def __init__(self,
-                 hidden_dim: int,
-                 rngs: nnx.Rngs):
-        input_dim = 256
-        H = input_dim + 2 * hidden_dim
-        self.gate = nnx.Einsum('bH, Hh -> bh',
-                            kernel_shape=(H, 5 * hidden_dim),
-                            bias_shape=5 * hidden_dim,
-                            param_dtype=jnp.float32,
-                            rngs=rngs)
+
+    def __init__(self, input_dim: int, hidden_dim: int, rngs: nnx.Rngs):
+        # 4 for causal neighbourhood of x[i,j] -> x[i,j-1], x[i-1,j-1], x[i-1,j] and x[i-1,j+1] 
+        self.hidden_dim = hidden_dim
+        H = 4 * input_dim + 2 * hidden_dim
+        self.gate = nnx.Einsum(
+            "bH, Hh -> bh",
+            kernel_shape=(H, 5 * hidden_dim),
+            bias_shape=5 * hidden_dim,
+            param_dtype=jnp.float32,
+            rngs=rngs,
+        )
         self.ln = nnx.LayerNorm(hidden_dim, rngs=rngs)
 
-    def __call__(self,
-                 x_bd,
-                 h_i_jm1,
-                 h_im1_j,
-                 c_i_jm1,
-                 c_im1_j):
-        x_bH = jnp.column_stack([x_bd, h_i_jm1, h_im1_j])
+    def __call__(self, x_b4h, h_b2h, c_b2h):
+        x_bH = jnp.column_stack([x_b4h, h_b2h])
         gate_out = self.gate(x_bH)
 
         f_c, f_r, i, o, g = jnp.split(gate_out, 5, axis=-1)
@@ -49,8 +47,12 @@ class SpatialLSTMCell(nnx.Module):
         cell_gate = nnx.tanh(g)
 
         # update cell state
-        cell_bh = forget_col_gate * c_i_jm1 + forget_row_gate * c_im1_j + \
-            input_gate * cell_gate
+        h = self.hidden_dim
+        cell_bh = (
+            forget_col_gate * c_b2h[:, :h]
+            + forget_row_gate * c_b2h[:, h:]
+            + input_gate * cell_gate
+        )
 
         # update hidden state
         state_bh = output_gate * nnx.tanh(self.ln(cell_bh))
@@ -58,101 +60,213 @@ class SpatialLSTMCell(nnx.Module):
         return state_bh, cell_bh
 
 class SpatialLSTM(nnx.Module):
-    def __init__(self,
-                 hidden_dim: int,
-                 rngs: nnx.Rngs):
-        self.input_dim = 256
+    def __init__(
+        self,
+        hidden_dim: int,
+        rngs: nnx.Rngs,
+    ):
+        input_dim = 256
         self.hidden_dim = hidden_dim
-        self.lstm = SpatialLSTMCell(hidden_dim, rngs)
-        self.head = nnx.Einsum('bh, hv -> bv',
-                               kernel_shape=(hidden_dim, 256),
-                               bias_shape=256,
-                               param_dtype=jnp.float32,
-                               rngs=rngs)
-        self.h_init = nnx.Param(nnx.initializers.glorot_normal()(rngs.params(), (hidden_dim, 1)))
 
-    # only supports gray-scale images
-    def __call__(self, x_bmnd):
-        assert x_bmnd.shape[-1] == 256
-        d = 256
-        m = x_bmnd.shape[1]
-        n = x_bmnd.shape[2]
-        b = x_bmnd.shape[0]
+        self.embedding = nnx.Embed(input_dim, hidden_dim, rngs=rngs)
+        self.lstm = SpatialLSTMCell(hidden_dim, hidden_dim, rngs)
+        self.h_init = nnx.Param(
+            nnx.initializers.glorot_normal()(rngs.params(), (1, hidden_dim))
+        )
+        self.head = nnx.Linear(hidden_dim, input_dim, rngs=rngs)
+
+    def _get_causal_neighborhood(self, x_bmnh, index):
+        _, n = x_bmnh.shape[1], x_bmnh.shape[2]
+        i, j = index//n, index%n
+        x_i_jm1 = x_bmnh[:, i, j-1]
+        x_im1_jm1 = x_bmnh[:, i-1, j-1]
+        x_im1_j = x_bmnh[:, i-1, j]
+        x_im1_jp1 = x_bmnh[:, i-1, j+1]
+        return jnp.concat((x_i_jm1, x_im1_jm1, x_im1_j, x_im1_jp1), axis=-1)
+
+    def get_causal_neighborhood_for_image_batch(self, x_bmnh):
+        f = partial(self._get_causal_neighborhood, x_bmnh=x_bmnh)
+        b, m, n, h = x_bmnh.shape
+        return jax.vmap(f)(index=jnp.arange(m*n)).reshape(b, m, n, 4*h)
+
+
+    def get_incoming_hidden_states(self, h_bmnh, index):
+        _, n = h_bmnh.shape[1], h_bmnh.shape[2]
+        i, j = index//n, index%n
+        h_i_jm1 = h_bmnh[:,i,j-1]
+        h_im1_j = h_bmnh[:,i-1,j]
+        return jnp.concat((h_i_jm1, h_im1_j), axis=-1)
+    
+    def _get_initial_hidden_state_for_image_batch(self, b, m, n):
         h = self.hidden_dim
+        h_bmnh = jnp.zeros((b,m+1,n+2,h), dtype=jnp.float32)
+        # fill top padding row with h_init
+        h_bmnh = h_bmnh.at[:,0].set(jnp.tile(self.h_init.value, (n+2, 1)))
+        # fill left padding column with h_init
+        h_bmnh = h_bmnh.at[:,:,0].set(jnp.tile(self.h_init.value, (m+1, 1)))
+        # fill right padding column with h_init
+        h_bmnh = h_bmnh.at[:,:,-1].set(jnp.tile(self.h_init.value, (m+1, 1)))
+        return h_bmnh
 
-        c_init = jnp.zeros((h, 1))
-        prev_row_h_nbh = jnp.tile(self.h_init.value[:, jnp.newaxis],
-                                  (1, n, b)).transpose(1, 2, 0)
-        prev_row_c_nbh = jnp.tile(c_init[:, jnp.newaxis],
-                                  (1, n, b)).transpose(1, 2, 0)
-
-        batch_image_logits = jnp.zeros(shape=(b,m,n,d), dtype=jnp.float32)
+    def __call__(self, x_bmn):
+        b, m, n = x_bmn.shape
+        h = self.hidden_dim
+        x_bmn = jnp.pad(x_bmn, pad_width=((0, 0), (1, 0), (1, 1)), mode='constant', constant_values=0)
+        x_bmnh = self.embedding(x_bmn)
+        h_bmnh = self._get_initial_hidden_state_for_image_batch(b,m,n)
+        c_bmnh = jnp.zeros((b,m+1,n+2,h), dtype=jnp.float32)
 
         @nnx.scan
-        def _scan_col(carry, x):
-            h_i_jm1, c_i_jm1 = carry
-            x_bd = x[:, :d]
-            h_im1_j = x[:, d:d+h]
-            c_im1_j = x[:, d+h:d+2*h]
+        def _scan_pixels(carry, x):
+            x_bmnh, h_bmnh, c_bmnh = carry
+            pixel_index = x
 
-            h_ij, c_ij = self.lstm(x_bd, h_i_jm1, h_im1_j, c_i_jm1, c_im1_j)
-            logits = self.head(h_ij)
+            i, j = pixel_index // (n+2), pixel_index % (n+2)
 
-            return (h_ij, c_ij), (h_ij, c_ij, logits)
+            neighbor_inputs_4h = self._get_causal_neighborhood(x_bmnh, pixel_index)
+            incoming_h_2h = self.get_incoming_hidden_states(h_bmnh, pixel_index)
+            incoming_c_2h = self.get_incoming_hidden_states(c_bmnh, pixel_index)
 
-        for i in range(m):
-            x_nbd = x_bmnd[:,i].transpose(1, 0, 2)
-            xs = jnp.concatenate((x_nbd, prev_row_h_nbh, prev_row_c_nbh), axis=-1)
-            carry = (jnp.tile(self.h_init.value, (1, b)).T, jnp.tile(c_init, (1, b)).T)
-            _, out = _scan_col(carry, xs)
-            prev_row_h_nbh = out[0]
-            prev_row_c_nbh = out[1]
-            row_logits = out[2].transpose(1, 0, 2)
-            batch_image_logits = batch_image_logits.at[:, i].set(row_logits)
+            h_bh, c_bh = self.lstm(neighbor_inputs_4h, incoming_h_2h, incoming_c_2h)
 
-        return batch_image_logits
+            h_bmnh = h_bmnh.at[:,i,j].set(h_bh)
+            c_bmnh = c_bmnh.at[:,i,j].set(c_bh)
+            return (x_bmnh, h_bmnh, c_bmnh), h_bh
 
-    def generate(self,
-                 im_height: int,
-                 im_width: int,
-                 batch_size: int,
-                 key: int):
+        carry = (x_bmnh, h_bmnh, c_bmnh)
+        xs = []
+        for i in range(1, m+1):
+            for j in range(1, n+1):
+                xs.append(i * (n+2) + j)
+        xs = jnp.array(xs)
+        _, h_sbh = _scan_pixels(carry, xs)
+        h_bmnh = h_sbh.reshape((b, m, n, h))
+
+        logits = self.head(h_bmnh)
+        return logits
+
+    def generate(self, im_height: int, im_width: int, batch_size: int, key: int):
+        b = batch_size
         m = im_height
         n = im_width
         h = self.hidden_dim
-        b = batch_size
-        d = 256
-        c_init = jnp.zeros((h, 1))
-        batch_image = jnp.zeros((b,m,n+1), dtype=jnp.uint8)
-        prev_row_h_nbh = jnp.tile(self.h_init.value[:, jnp.newaxis],
-                                  (1, n, b)).transpose(1, 2, 0)
-        prev_row_c_nbh = jnp.tile(c_init[:, jnp.newaxis],
-                                  (1, n, b)).transpose(1, 2, 0)
+
+        x_bmn = jnp.zeros((b, m+1, n+2), dtype=jnp.uint8)
+        x_bmnh = self.embedding(x_bmn)
+        h_bmnh = self._get_initial_hidden_state_for_image_batch(b,m,n)
+        c_bmnh = jnp.zeros((b,m+1,n+2,h), dtype=jnp.float32)
 
         @nnx.scan
-        def _gen_scan_col(carry, x):
-            h_i_jm1, c_i_jm1, x_b, key = carry
-            x_bd = nnx.one_hot(x_b, d)
-            h_im1_j = x[:, :h]
-            c_im1_j = x[:, h:2*h]
+        def _scan_pixels(carry, x):
+            x_bmnh, h_bmnh, c_bmnh, key = carry
+            pixel_index = x
 
-            h_ij, c_ij = self.lstm(x_bd, h_i_jm1, h_im1_j, c_i_jm1, c_im1_j)
+            i, j = pixel_index // (n+2), pixel_index % (n+2)
 
-            logits = self.head(h_ij)
+            neighbor_inputs_4h = self._get_causal_neighborhood(x_bmnh, pixel_index)
+            incoming_h_2h = self.get_incoming_hidden_states(h_bmnh, pixel_index)
+            incoming_c_2h = self.get_incoming_hidden_states(c_bmnh, pixel_index)
+
+            h_bh, c_bh = self.lstm(neighbor_inputs_4h, incoming_h_2h, incoming_c_2h)
+
+            h_bmnh = h_bmnh.at[:,i,j].set(h_bh)
+            c_bmnh = c_bmnh.at[:,i,j].set(c_bh)
+
+            logits = self.head(h_bh)
             sampled_x_b = jax.random.categorical(key, logits, axis=-1)
+
+            sampled_x_bh = self.embedding(sampled_x_b)
+            x_bmnh = x_bmnh.at[:,i,j].set(sampled_x_bh)
             key, _ = jax.random.split(key)
 
-            return (h_ij, c_ij, sampled_x_b, key), (h_ij, c_ij, sampled_x_b)
+            return (x_bmnh, h_bmnh, c_bmnh, key), sampled_x_b
 
-        x_init = jnp.zeros(b, dtype=jnp.int32)
-        for i in range(m):
-            xs = jnp.concatenate((prev_row_h_nbh, prev_row_c_nbh), axis=-1)
-            carry = (jnp.tile(self.h_init.value, (1, b)).T,
-                     jnp.tile(c_init, (1, b)).T,
-                     x_init,
-                     key)
-            final_carry, out = _gen_scan_col(carry, xs)
-            prev_row_h_nbh, prev_row_c_nbh, sampled_row_pixels = out
-            key, _ = jax.random.split(final_carry[3])
-            batch_image = batch_image.at[:, i, 1:].set(sampled_row_pixels.T)
-        return batch_image
+        carry = (x_bmnh, h_bmnh, c_bmnh, key)
+        xs = []
+        for i in range(1, m+1):
+            for j in range(1, n+1):
+                xs.append(i * (n+2) + j)
+        xs = jnp.array(xs)
+        _, sampled_x_sb = _scan_pixels(carry, xs)
+
+        sampled_image_batch = sampled_x_sb.transpose(1, 0).reshape((b, m, n))
+        return sampled_image_batch
+    
+    def complete_image(self, image, coord, b, key: int):
+        """
+        coord: position of first pixel in the image that needs to be in-painted.
+        """
+        m = image.shape[0]
+        n = image.shape[1]
+        h = self.hidden_dim
+
+        x_bmn = jnp.zeros((b, m+1, n+2), dtype=jnp.uint8)
+        x_bmn = x_bmn.at[:,1:,1:-1].set(
+            jnp.tile(image[jnp.newaxis, :, :], (b, 1, 1))
+            )
+        x_bmnh = self.embedding(x_bmn)
+        h_bmnh = self._get_initial_hidden_state_for_image_batch(b,m,n)
+        c_bmnh = jnp.zeros((b,m+1,n+2,h), dtype=jnp.float32)
+
+        @nnx.scan
+        def eval_scan_pixels(carry, x):
+            x_bmnh, h_bmnh, c_bmnh = carry
+            pixel_index = x
+
+            i, j = pixel_index // (n+2), pixel_index % (n+2)
+
+            neighbor_inputs_4h = self._get_causal_neighborhood(x_bmnh, pixel_index)
+            incoming_h_2h = self.get_incoming_hidden_states(h_bmnh, pixel_index)
+            incoming_c_2h = self.get_incoming_hidden_states(c_bmnh, pixel_index)
+
+            h_bh, c_bh = self.lstm(neighbor_inputs_4h, incoming_h_2h, incoming_c_2h)
+
+            h_bmnh = h_bmnh.at[:,i,j].set(h_bh)
+            c_bmnh = c_bmnh.at[:,i,j].set(c_bh)
+            return (x_bmnh, h_bmnh, c_bmnh), h_bh
+
+        @nnx.scan
+        def gen_scan_pixels(carry, x):
+            x_bmnh, h_bmnh, c_bmnh, x_bmn, key = carry
+            pixel_index = x
+
+            i, j = pixel_index // (n+2), pixel_index % (n+2)
+
+            neighbor_inputs_4h = self._get_causal_neighborhood(x_bmnh, pixel_index)
+            incoming_h_2h = self.get_incoming_hidden_states(h_bmnh, pixel_index)
+            incoming_c_2h = self.get_incoming_hidden_states(c_bmnh, pixel_index)
+
+            h_bh, c_bh = self.lstm(neighbor_inputs_4h, incoming_h_2h, incoming_c_2h)
+
+            h_bmnh = h_bmnh.at[:,i,j].set(h_bh)
+            c_bmnh = c_bmnh.at[:,i,j].set(c_bh)
+
+            logits = self.head(h_bh)
+            sampled_x_b = jax.random.categorical(key, logits, axis=-1)
+            x_bmn = x_bmn.at[:,i,j].set(sampled_x_b)
+
+            sampled_x_bh = self.embedding(sampled_x_b)
+            x_bmnh = x_bmnh.at[:,i,j].set(sampled_x_bh)
+            key, _ = jax.random.split(key)
+
+            return (x_bmnh, h_bmnh, c_bmnh, x_bmn, key), sampled_x_b
+
+        # first build up state for non-masked part of image.
+        carry = (x_bmnh, h_bmnh, c_bmnh)
+        xs = []
+        for i in range(1, m+1):
+            for j in range(1, n+1):
+                xs.append(i * (n+2) + j)
+        xs = jnp.array(xs)
+
+        coord_index_in_padded = (coord[0] + 1) * (n+2) + (coord[1] + 1)
+        xs_eval = xs[xs < coord_index_in_padded]
+        xs_completion = xs[xs >= coord_index_in_padded]
+
+        carry, _ = eval_scan_pixels(carry, xs_eval)
+
+        carry = (carry[0], carry[1], carry[2], x_bmn, key)
+        carry, _ = gen_scan_pixels(carry, xs_completion)
+
+        x_bmn_completed = carry[3]
+        return x_bmn_completed
