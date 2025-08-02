@@ -148,7 +148,7 @@ class RowLSTM(nnx.Module):
         else:
             self.head = nnx.Linear(output_conv_out_channels[-1], preds_dim, rngs=rngs)
 
-    def __call__(self, im_bmnc):
+    def __call__(self, im_bmnc: jax.Array):
         b, m, n, c = im_bmnc.shape
 
         L = self.num_layers

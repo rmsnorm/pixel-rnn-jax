@@ -11,11 +11,30 @@ This repo implements the 3 variants of PixelRNN (van den Oord et. al.) namely, R
 
 ||Row-LSTM | Diagonal-BiLSTM | PixelCNN|
 |-|--|--|--|
-|Basic impl|&#x2611;|--|&#x2611;|
-|Residual Connections|&#x2611;|--|&#x2611;|
-|Skip Connections|&#x2611;|--|--|
+|Basic impl|&#x2611;|&#x2611;|&#x2611;|
+|Residual Connections|&#x2611;|&#x2611;|&#x2611;|
+|Skip Connections|&#x2611;|&#x2611;|--|
 |Supports RGB images (masked conv)|--|--|--|
 
+### Trained Diagonal-BiLSTM on Binarized MNIST
+
+You can find the training loop in diagonal_bilstm_mnist.ipynb . 
+
+<img src="generated_images/diagonal-bilstm-binarized-mnist.png" alt="Diagonal-BiLSTM-Binarized-MNIST" width="300" height="300">
+
+The above images are generated from a Diagonal-BiLSTM trained with
+
+- model hyper-params:
+    - hidden_dim = 16
+    - num-layers = 7
+    - skip-connections & residual connections
+- training params:
+    - batch-size = 64
+    - training-images = 6M
+    - on binarized MNIST data
+    - Adam with lr=1e-3
+
+This achieves a NLL of ~80 nats (== 55.3 bits) which is almost same as the paper.
 
 ### Trained Row-LSTM on Binarized MNIST
 
