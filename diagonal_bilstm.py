@@ -48,25 +48,72 @@ def create_mask(
     return mask
 
 
+def lstm_bias_init(key, shape, dtype=jnp.float32, gate_type="forget"):
+    """Initialize LSTM biases with gate-specific values"""
+    bias = jnp.zeros(shape, dtype=dtype)
+    if gate_type == "forget":
+        # Initialize forget gate bias to 1.0 to remember by default
+        bias = bias + 1.0
+    elif gate_type in ["input", "output"]:
+        # Slight negative bias for input/output gates
+        bias = bias - 0.1
+    # Cell gate bias stays at 0
+    return bias
+
+
+def masked_conv_init(key, shape, mask, dtype=jnp.float32):
+    """
+    Initialize masked convolution with proper fan-in calculation
+    considering only the non-masked connections.
+    """
+    # Calculate effective fan_in considering mask
+    effective_fan_in = jnp.sum(mask[:, :, 0, 0])  # Count non-zero entries
+    std = (
+        math.sqrt(2.0 / effective_fan_in)
+        if effective_fan_in > 0
+        else math.sqrt(2.0 / shape[2])
+    )
+
+    weights = jax.random.normal(key, shape, dtype) * std
+    return weights * mask  # Apply mask to weights
+
+
 class DiagonalLSTMCell(nnx.Module):
     def __init__(self, features: int, image_channels: int, rngs: nnx.Rngs):
+        s = jnp.arange(2 * features)
+        r_in = s[0::3].shape[0]
+        g_in = s[1::3].shape[0]
+        b_in = s[2::3].shape[0]
+        self.layer_norms = [
+            nnx.LayerNorm(r_in, rngs=rngs),
+            nnx.LayerNorm(g_in, rngs=rngs),
+            nnx.LayerNorm(b_in, rngs=rngs),
+        ]
+
         # todo: support conv masking for rgb images
         mask_b = create_mask((1, 1), 2 * features, features, image_channels, "mask_b")
         mask_b = nnx.Variable(mask_b)
         # is_kernels is a stack of 4 kernels instead of 1 kernel with 4*features
         # to maintain the offsets in convolutional masking correctly. Otherwise,
         # it leads to inter-channel leakage.
-        self.is_kernels = [
-            nnx.Conv(
+
+        # Separate kernels for each gate with specialized initialization
+        gate_types = ["input", "forget", "output", "cell"]
+        self.is_kernels = []
+
+        for gate_type in gate_types:
+            kernel = nnx.Conv(
                 in_features=2 * features,
                 out_features=features,
                 kernel_size=(1, 1),
                 rngs=rngs,
                 kernel_init=nnx.initializers.he_uniform(),
+                bias_init=lambda key, shape, dtype: lstm_bias_init(
+                    key, shape, dtype, gate_type
+                ),
                 mask=mask_b,
             )
-            for _ in range(4)
-        ]
+            self.is_kernels.append(kernel)
 
         self.ss_kernel = nnx.Conv(
             in_features=features,
@@ -92,7 +139,20 @@ class DiagonalLSTMCell(nnx.Module):
     def __call__(self, x_b1mh, prev_h_b1mh, prev_c_b1mh):
         # is called once per diagonal, i.e. once per column after skewing the inputs
         b, _, m, h = x_b1mh.shape
-        i2s_4b1mh = [kernel(x_b1mh) for kernel in self.is_kernels]
+        x_ln = [self.layer_norms[i](x_b1mh[:, :, :, i::3]) for i in range(3)]
+        x_ln = jnp.concatenate(
+            [
+                arr[..., i : i + 1]
+                for i in range(
+                    max(x_ln[0].shape[-1], x_ln[1].shape[-1], x_ln[2].shape[-1])
+                )
+                for arr in x_ln
+                if i < arr.shape[-1]
+            ],
+            axis=-1,
+        )
+
+        i2s_4b1mh = [kernel(x_ln) for kernel in self.is_kernels]
         i2s_b1m4h = (
             jnp.stack(i2s_4b1mh).transpose(1, 2, 3, 0, 4).reshape(b, 1, m, 2 * h)
         )
@@ -209,6 +269,15 @@ class DiagonalBiLSTM(nnx.Module):
                 )
             )
 
+        first_output_mask = nnx.Variable(
+            create_mask(
+                (1, 1),
+                2 * features,
+                output_conv_out_channels[0],
+                image_channels,
+                "mask_b",
+            )
+        )
         self.output_convs = [
             nnx.Conv(
                 in_features=2 * features,
@@ -216,50 +285,46 @@ class DiagonalBiLSTM(nnx.Module):
                 kernel_size=(1, 1),
                 rngs=rngs,
                 kernel_init=nnx.initializers.he_uniform(),
-                mask=nnx.Variable(
-                    create_mask(
-                        (1, 1),
-                        2 * features,
-                        output_conv_out_channels[0],
-                        image_channels,
-                        "mask_b",
-                    )
-                ),
+                mask=first_output_mask,
             )
-        ] + [
-            nnx.Conv(
-                in_features=output_conv_out_channels[i - 1],
-                out_features=output_conv_out_channels[i],
-                kernel_size=(1, 1),
-                rngs=rngs,
-                kernel_init=nnx.initializers.he_uniform(),
-                mask=nnx.Variable(
-                    create_mask(
-                        (1, 1),
-                        output_conv_out_channels[i - 1],
-                        output_conv_out_channels[i],
-                        image_channels,
-                        "mask_b",
-                    ),
-                ),
-            )
-            for i in range(1, len(output_conv_out_channels))
         ]
+        for i in range(1, len(output_conv_out_channels)):
+            out_mask = nnx.Variable(
+                create_mask(
+                    (1, 1),
+                    output_conv_out_channels[i - 1],
+                    output_conv_out_channels[i],
+                    image_channels,
+                    "mask_b",
+                ),
+            )
+            self.output_convs.append(
+                nnx.Conv(
+                    in_features=output_conv_out_channels[i - 1],
+                    out_features=output_conv_out_channels[i],
+                    kernel_size=(1, 1),
+                    rngs=rngs,
+                    kernel_init=nnx.initializers.he_uniform(),
+                    mask=out_mask,
+                )
+            )
 
         if is_rgb:
             s = jnp.arange(output_conv_out_channels[-1])
             r_in = s[0::3].shape[0]
             g_in = s[1::3].shape[0]
             b_in = s[2::3].shape[0]
-            self.r_head = nnx.Linear(r_in, 256, rngs=rngs)
-            self.g_head = nnx.Linear(g_in, 256, rngs=rngs)
-            self.b_head = nnx.Linear(b_in, 256, rngs=rngs)
+            small_init = nnx.initializers.normal(stddev=0.01)
+            self.r_head = nnx.Linear(r_in, 256, rngs=rngs, kernel_init=small_init)
+            self.g_head = nnx.Linear(g_in, 256, rngs=rngs, kernel_init=small_init)
+            self.b_head = nnx.Linear(b_in, 256, rngs=rngs, kernel_init=small_init)
         else:
             self.head = nnx.Linear(output_conv_out_channels[-1], preds_dim, rngs=rngs)
 
     def compute_shared_features(self, im_bmnc: jax.Array):
         if self.image_channels == 3:
             im_bmnc = (im_bmnc - 128.0) / 256.0
+            # im_bmnc = im_bmnc / 255.0
 
         x_bmnh = self.input_conv(im_bmnc)
         # skew the input map
