@@ -14,7 +14,7 @@ This repo implements the 3 variants of PixelRNN (van den Oord et. al.) namely, R
 |Basic impl|&#x2611;|&#x2611;|&#x2611;|
 |Residual Connections|&#x2611;|&#x2611;|&#x2611;|
 |Skip Connections|&#x2611;|&#x2611;|--|
-|Supports RGB images (masked conv)|--|--|--|
+|Supports RGB images (masked conv)|--|&#x2611;|--|
 
 ### Trained Diagonal-BiLSTM on Binarized MNIST
 
